@@ -1,0 +1,239 @@
+"""
+server/api.py — FastAPI backend for the Domain Flip Bot web dashboard
+
+Serves live data from the SQLite database to the React frontend.
+Run with: uvicorn server.api:app --reload --port 8000
+
+Endpoints:
+  GET  /api/stats          — overall bot statistics
+  GET  /api/domains        — paginated domain list with filters
+  GET  /api/domains/hot    — top domains above alert threshold
+  GET  /api/scan/history   — recent scan run history
+  POST /api/scan/trigger   — manually trigger a bot scan
+  POST /api/register       — manually register a domain
+  GET  /api/spend          — today's auto-register spend
+  GET  /api/trends         — Google Trends data for top domains
+  GET  /api/emails         — outreach emails from last run
+"""
+
+import os
+import json
+import asyncio
+import sqlite3
+from datetime import datetime, date
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Query, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Add parent to path so we can import bot modules
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from core.database import DomainDB
+from autoregister.auto_register import SpendTracker
+
+app = FastAPI(title="AI Domain Flip Bot", version="4.0")
+
+# Allow React dev server to connect
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+db      = DomainDB()
+tracker = SpendTracker()
+
+ALERT_THRESHOLD = int(os.getenv("ALERT_THRESHOLD", "85"))
+OUTREACH_FILE   = Path(__file__).parent.parent / "outreach_emails.txt"
+SALES_CACHE     = Path(__file__).parent.parent / "data" / "sales_cache.json"
+
+
+# ── MODELS ────────────────────────────────────────────────────────────────────
+class RegisterRequest(BaseModel):
+    domain: str
+
+class ScanRequest(BaseModel):
+    mode: str = "full"
+
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def row_to_dict(row, cursor) -> dict:
+    return dict(zip([d[0] for d in cursor.description], row))
+
+
+# ── ROUTES ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/stats")
+async def get_stats():
+    stats = db.get_stats()
+    spend = tracker.spent_today
+    cap   = float(os.getenv("DAILY_SPEND_CAP", "50"))
+    return {
+        **stats,
+        "spent_today":    round(spend, 2),
+        "daily_cap":      cap,
+        "remaining":      round(cap - spend, 2),
+        "alert_threshold": ALERT_THRESHOLD,
+        "auto_reg_enabled": os.getenv("ENABLE_AUTO_REGISTER","false").lower() == "true",
+    }
+
+
+@app.get("/api/domains")
+async def get_domains(
+    page:       int   = Query(1, ge=1),
+    per_page:   int   = Query(25, ge=1, le=100),
+    min_score:  int   = Query(0),
+    vertical:   Optional[str] = None,
+    domain_type:Optional[str] = None,
+    available:  Optional[bool] = None,
+    search:     Optional[str] = None,
+    sort:       str   = Query("score"),
+):
+    rows = db.get_all(min_score=min_score, domain_type=domain_type)
+
+    # Filter
+    if vertical:
+        rows = [r for r in rows if r.get("vertical","").lower() == vertical.lower()]
+    if available is not None:
+        status = "available" if available else "registered"
+        rows = [r for r in rows if r.get("status") == status]
+    if search:
+        rows = [r for r in rows if search.lower() in r.get("domain","").lower()]
+
+    # Sort
+    reverse = True
+    if sort == "name":
+        rows.sort(key=lambda x: x.get("domain",""), reverse=False)
+        reverse = False
+    elif sort == "value":
+        rows.sort(key=lambda x: x.get("est_high", 0) or 0, reverse=True)
+    elif sort == "date":
+        rows.sort(key=lambda x: x.get("first_seen",""), reverse=True)
+    else:
+        rows.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    total  = len(rows)
+    start  = (page - 1) * per_page
+    paged  = rows[start:start + per_page]
+
+    return {
+        "total":    total,
+        "page":     page,
+        "per_page": per_page,
+        "pages":    (total + per_page - 1) // per_page,
+        "domains":  paged,
+    }
+
+
+@app.get("/api/domains/hot")
+async def get_hot_domains():
+    rows = db.get_all(min_score=ALERT_THRESHOLD)
+    return {"domains": rows[:20], "count": len(rows)}
+
+
+@app.get("/api/domains/{domain}")
+async def get_domain(domain: str):
+    rows = db.get_all()
+    match = next((r for r in rows if r["domain"] == domain), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="Domain not found")
+    # Parse breakdown JSON
+    if isinstance(match.get("breakdown"), str):
+        try:
+            match["breakdown"] = json.loads(match["breakdown"])
+        except Exception:
+            pass
+    return match
+
+
+@app.get("/api/spend")
+async def get_spend():
+    tracker._load()
+    return {
+        "spent_today":    round(tracker.spent_today, 2),
+        "daily_cap":      float(os.getenv("DAILY_SPEND_CAP", "50")),
+        "remaining":      round(tracker.remaining, 2),
+        "registrations":  tracker.data.get("registrations", []),
+    }
+
+
+@app.get("/api/sales")
+async def get_comparable_sales():
+    if SALES_CACHE.exists():
+        data = json.loads(SALES_CACHE.read_text())
+        return {
+            "updated":  data.get("updated"),
+            "count":    len(data.get("sales", [])),
+            "sales":    data.get("sales", [])[:50],
+        }
+    return {"updated": None, "count": 0, "sales": []}
+
+
+@app.get("/api/emails")
+async def get_outreach_emails():
+    if not OUTREACH_FILE.exists():
+        return {"emails": [], "count": 0}
+    content = OUTREACH_FILE.read_text()
+    blocks  = [b.strip() for b in content.split("="*60) if b.strip()]
+    emails  = []
+    for block in blocks:
+        lines = block.split("\n")
+        emails.append({
+            "header": lines[0] if lines else "",
+            "body":   "\n".join(lines[1:]).strip(),
+        })
+    return {"emails": emails, "count": len(emails)}
+
+
+@app.post("/api/register")
+async def manual_register(req: RegisterRequest, background_tasks: BackgroundTasks):
+    domain = req.domain.lower().strip()
+    if not domain.endswith(".ai"):
+        domain += ".ai"
+
+    async def do_register():
+        import aiohttp
+        from autoregister.auto_register import register_via_porkbun
+        async with aiohttp.ClientSession() as session:
+            result = await register_via_porkbun(session, domain)
+        if result["success"]:
+            db.mark_registered(domain, 0)
+
+    background_tasks.add_task(do_register)
+    return {"status": "queued", "domain": domain}
+
+
+@app.post("/api/scan/trigger")
+async def trigger_scan(req: ScanRequest, background_tasks: BackgroundTasks):
+    async def run_scan():
+        import subprocess, sys
+        subprocess.Popen([sys.executable, "bot.py", "--mode", req.mode],
+                        cwd=Path(__file__).parent.parent)
+
+    background_tasks.add_task(run_scan)
+    return {"status": "triggered", "mode": req.mode}
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "time": datetime.now().isoformat()}
+
+
+# Serve React build in production
+frontend_build = Path(__file__).parent / "dashboard" / "dist"
+if frontend_build.exists():
+    app.mount("/assets", StaticFiles(directory=str(frontend_build / "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        return FileResponse(str(frontend_build / "index.html"))
