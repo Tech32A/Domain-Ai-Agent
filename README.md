@@ -1,226 +1,122 @@
-"""
-pricing/trends_scorer.py — Google Trends momentum scoring
+# 🤖 AI Domain Flip Bot
 
-Adds a trend momentum layer to domain scoring:
-- Rising keyword = score bonus (up to +15 points)
-- Falling keyword = score penalty (up to -10 points)
-- Stable = no change
+Hunt, score, and alert on high-value `.ai` domains across three strategies:
+**unregistered** (never taken) · **expiring** (dropping back to market) · **aftermarket** (underpriced listings)
 
-Uses pytrends (unofficial Google Trends API — free, no key needed).
-Falls back to keyword heuristics if pytrends is unavailable.
+---
 
-Install: pip install pytrends
-"""
+## Architecture
 
-import json
-import time
-import asyncio
-from pathlib import Path
-from core.logger import log
+```
+domainbot/
+├── bot.py                  ← Main orchestrator (run this)
+├── report.py               ← Export & view results
+├── requirements.txt
+├── .env.template           ← Copy to .env, add your keys
+│
+├── generators/             ← HOW domains are discovered
+│   ├── keyword_generator.py   Semantic keyword combos (no API needed)
+│   ├── ai_generator.py        Claude AI generates brandable names
+│   └── vc_scraper.py          Scrapes VC/funding news for trends
+│
+├── hunters/                ← WHERE availability is checked
+│   ├── availability_hunter.py  GoDaddy + WhoisXML consensus check
+│   ├── expiry_hunter.py        Drop lists + watchlist WHOIS expiry
+│   └── market_hunter.py        Sedo, Afternic, Dan.com underpriced scan
+│
+├── core/
+│   ├── scorer.py           ← Flip potential scoring engine (0–100)
+│   ├── database.py         ← SQLite persistence
+│   └── logger.py           ← Colored terminal output
+│
+├── alerts/
+│   └── notifier.py         ← Email + SMS alerts
+│
+└── data/
+    └── domains.db          ← Auto-created SQLite database
+```
 
-TRENDS_CACHE = Path(__file__).parent.parent / "data" / "trends_cache.json"
-CACHE_TTL    = 86400  # 24 hours — trends don't change that fast
+---
 
+## Setup
 
-# ── TREND CLASSIFIER ──────────────────────────────────────────────────────────
-def classify_trend(values: list[int]) -> tuple[str, int]:
-    """
-    Given a list of weekly interest values (0-100),
-    returns (direction, score_delta).
-    direction: "rising" | "stable" | "falling"
-    score_delta: -10 to +15
-    """
-    if not values or len(values) < 4:
-        return "stable", 0
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
 
-    recent = sum(values[-4:]) / 4   # last month avg
-    older  = sum(values[-12:-4]) / 8 if len(values) >= 12 else sum(values[:-4]) / max(len(values[:-4]),1)
+# 2. Configure API keys
+cp .env.template .env
+# Edit .env with your keys
 
-    if older == 0:
-        return "rising", 10
+# 3. Run a full scan
+python bot.py
 
-    change_pct = ((recent - older) / older) * 100
+# 4. View results
+python report.py
+python report.py --export csv
+```
 
-    if change_pct >= 50:   return "rising",  15
-    if change_pct >= 20:   return "rising",  10
-    if change_pct >= 5:    return "rising",   5
-    if change_pct <= -30:  return "falling", -10
-    if change_pct <= -15:  return "falling",  -5
-    return "stable", 0
+---
 
+## Run Modes
 
-# ── CACHE LAYER ───────────────────────────────────────────────────────────────
-def load_cache() -> dict:
-    if TRENDS_CACHE.exists():
-        try:
-            data = json.loads(TRENDS_CACHE.read_text())
-            if time.time() - data.get("updated_at", 0) < CACHE_TTL:
-                return data.get("keywords", {})
-        except Exception:
-            pass
-    return {}
+| Command | What it does |
+|---|---|
+| `python bot.py` | Full scan — all three strategies |
+| `python bot.py --mode fast` | Unregistered domains only (fastest) |
+| `python bot.py --mode expiring` | Drop list + watchlist only |
+| `python bot.py --mode market` | Aftermarket underpriced only |
+| `python bot.py --continuous` | Runs every N hours (set SCAN_INTERVAL_HR in .env) |
 
-def save_cache(keywords: dict):
-    TRENDS_CACHE.parent.mkdir(exist_ok=True)
-    TRENDS_CACHE.write_text(json.dumps({
-        "updated_at": time.time(),
-        "keywords":   keywords,
-    }, indent=2))
+---
 
+## Scoring System
 
-# ── PYTRENDS FETCHER ──────────────────────────────────────────────────────────
-async def fetch_trends_pytrends(keywords: list[str]) -> dict:
-    """Fetch Google Trends data via pytrends"""
-    try:
-        from pytrends.request import TrendReq
-    except ImportError:
-        log("TREND", "  pytrends not installed — run: pip install pytrends")
-        return {}
+Every domain is scored 0–100 based on:
 
-    results = {}
-    # Pytrends is synchronous — run in thread pool
-    loop = asyncio.get_event_loop()
+| Factor | Max Points | Notes |
+|---|---|---|
+| Keyword match | 40 | Industry keyword weight × relevance |
+| Length | 30 | Shorter = more valuable |
+| Pattern | 20 | Single word > compound > hyphenated |
+| Memorability | 10 | Penalizes numbers, double hyphens |
+| Type bonus | +5 | Expiring domains get slight boost |
 
-    def _fetch():
-        pt = TrendReq(hl="en-US", tz=360, timeout=(10, 25), retries=2, backoff_factor=0.5)
-        out = {}
-        # Batch in groups of 5 (pytrends limit)
-        for i in range(0, len(keywords), 5):
-            batch = keywords[i:i+5]
-            try:
-                pt.build_payload(batch, cat=0, timeframe="today 12-m", geo="", gprop="")
-                df = pt.interest_over_time()
-                if df.empty:
-                    continue
-                for kw in batch:
-                    if kw in df.columns:
-                        values = df[kw].tolist()
-                        direction, delta = classify_trend(values)
-                        out[kw] = {
-                            "direction": direction,
-                            "delta":     delta,
-                            "peak":      max(values),
-                            "recent":    round(sum(values[-4:])/4),
-                        }
-                time.sleep(2)  # be polite to Google
-            except Exception as e:
-                log("TREND", f"  Batch error: {str(e)[:60]}")
-                continue
-        return out
+**Alert threshold default: 85** — change in `.env`
 
-    try:
-        results = await loop.run_in_executor(None, _fetch)
-    except Exception as e:
-        log("TREND", f"  pytrends fetch failed: {str(e)[:60]}")
+---
 
-    return results
+## API Keys Needed
 
+| Key | Where to get | Required? |
+|---|---|---|
+| GoDaddy API key + secret | developer.godaddy.com/keys | ✅ Yes |
+| WhoisXML API key | whoisxmlapi.com | ✅ Yes |
+| Anthropic API key | console.anthropic.com | Recommended |
+| Namecheap API | namecheap.com/support/api | Optional |
+| Gmail App Password | myaccount.google.com/apppasswords | For email alerts |
+| Twilio credentials | twilio.com | For SMS alerts |
 
-# ── HEURISTIC FALLBACK ────────────────────────────────────────────────────────
-# When pytrends fails, use keyword knowledge as a fallback signal
-KNOWN_RISING = {
-    "agent","agentic","workflow","automate","copilot","voice","multimodal",
-    "rag","embedding","finetune","kyc","compliance","fraud","triage","oncology",
-    "discovery","paralegal","upskill","certify","assessment","underwrite",
-}
-KNOWN_FALLING = {
-    "chatbot","nft","metaverse","blockchain","crypto","web3","dao",
-}
+---
 
-def heuristic_trend(keyword: str) -> tuple[str, int]:
-    kw = keyword.lower()
-    for r in KNOWN_RISING:
-        if r in kw: return "rising", 8
-    for f in KNOWN_FALLING:
-        if f in kw: return "falling", -8
-    return "stable", 0
+## Scaling to Web (Future)
 
+This bot is built to scale. When you're ready:
 
-# ── MAIN TRENDS SCORER ────────────────────────────────────────────────────────
-class TrendsScorer:
-    def __init__(self):
-        self.cache = load_cache()
+1. **API layer**: Wrap `bot.py` with FastAPI — expose `/scan`, `/results`, `/stats` endpoints
+2. **Scheduler**: Replace `asyncio.sleep` loop with Celery + Redis for robust scheduling
+3. **Database**: Swap SQLite for PostgreSQL — schema is already compatible
+4. **Frontend**: Connect the React dashboard (domain-live-dashboard.jsx) to the API
+5. **Deploy**: Docker → Railway / Fly.io / AWS EC2
 
-    async def enrich(self, keywords: list[str]) -> dict[str, dict]:
-        """
-        Fetch trend data for a list of keywords.
-        Returns dict: keyword → {direction, delta, peak, recent}
-        """
-        # Split into cached vs needs fetching
-        cached   = {kw: self.cache[kw] for kw in keywords if kw in self.cache}
-        to_fetch = [kw for kw in keywords if kw not in self.cache]
+The folder structure already maps 1:1 to a production web service.
 
-        if to_fetch:
-            log("TREND", f"Fetching Google Trends for {len(to_fetch)} keywords...")
-            fetched = await fetch_trends_pytrends(to_fetch)
+---
 
-            # Fill gaps with heuristics
-            for kw in to_fetch:
-                if kw not in fetched:
-                    direction, delta = heuristic_trend(kw)
-                    fetched[kw] = {
-                        "direction": direction,
-                        "delta":     delta,
-                        "peak":      None,
-                        "recent":    None,
-                        "source":    "heuristic",
-                    }
+## Tips for Maximizing Finds
 
-            self.cache.update(fetched)
-            save_cache(self.cache)
-
-        all_results = {**cached, **{kw: self.cache.get(kw, {"direction":"stable","delta":0}) for kw in to_fetch}}
-        return all_results
-
-    def score_domain(self, domain: str, trend_data: dict) -> tuple[int, str]:
-        """
-        Apply trend delta to domain score.
-        Returns (delta, direction_label)
-        """
-        name = domain.replace(".ai","").replace(".io","").replace(".com","").lower()
-
-        # Find best matching keyword in trend data
-        best_delta     = 0
-        best_direction = "stable"
-
-        for kw, data in trend_data.items():
-            if kw.lower() in name:
-                delta = data.get("delta", 0)
-                if abs(delta) > abs(best_delta):
-                    best_delta     = delta
-                    best_direction = data.get("direction", "stable")
-
-        # Fallback to heuristic
-        if best_delta == 0:
-            best_direction, best_delta = heuristic_trend(name)
-
-        return best_delta, best_direction
-
-    async def enrich_results(self, results: list[dict]) -> list[dict]:
-        """Add trend scoring to a list of domain results"""
-        if not results:
-            return results
-
-        # Extract unique keywords from domain names
-        keywords = set()
-        for r in results:
-            name = r["domain"].replace(".ai","").replace(".io","").replace(".com","").lower()
-            # Split compound words roughly
-            import re
-            words = re.findall(r'[a-z]{3,}', name)
-            keywords.update(words)
-
-        trend_data = await self.enrich(list(keywords)[:50])  # cap at 50 keywords
-
-        for r in results:
-            delta, direction = self.score_domain(r["domain"], trend_data)
-            r["trend_direction"] = direction
-            r["trend_delta"]     = delta
-            r["trend_score"]     = r.get("score", 0) + delta
-            # Clamp to 0-100
-            r["trend_score"]     = max(0, min(100, r["trend_score"]))
-
-        # Re-sort by trend score
-        results.sort(key=lambda x: -x.get("trend_score", x.get("score", 0)))
-        log("TREND", f"Trend scoring complete — {len(results)} domains enriched")
-        return results
+- Run `--mode fast` every 2–3 hours (cheap, catches new registrations)
+- Run `--mode expiring` daily (drop lists refresh overnight)
+- Run `--mode market` weekly (aftermarket moves slower)
+- Set `ALERT_THRESHOLD=80` to catch more opportunities early
+- The `data/domains.db` grows over time — run `report.py` to see trends

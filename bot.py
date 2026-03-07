@@ -1,271 +1,214 @@
+#!/usr/bin/env python3
 """
-pricing/comparable_sales.py — Real .ai domain sales data engine
+╔══════════════════════════════════════════════════════════════╗
+║           AI DOMAIN FLIP BOT — Main Orchestrator            ║
+║  Hunts unregistered + expiring + underpriced .ai domains    ║
+║  Generates ideas via AI + VC scraping + keyword combos      ║
+║  Scores, ranks, alerts — built to scale to web later        ║
+╚══════════════════════════════════════════════════════════════╝
 
-Scrapes NameBio + DNJournal for actual recent .ai domain sales,
-builds a local pricing model, gives every domain a data-backed
-asking price instead of a guess.
+QUICK START:
+  pip install -r requirements.txt
+  cp .env.template .env        # add your API keys
+  python bot.py                # full scan
+  python bot.py --mode fast    # quick unregistered check only
+  python bot.py --mode expiring # focus on dropping domains
+  python bot.py --mode market  # aftermarket underpriced scan
 """
 
-import re
-import json
+import argparse
 import asyncio
-import aiohttp
+import json
+import os
+import sys
+import time
+from datetime import datetime
 from pathlib import Path
-from datetime import datetime, timedelta
-from html.parser import HTMLParser
-from core.logger import log
 
-SALES_CACHE = Path(__file__).parent.parent / "data" / "sales_cache.json"
-CACHE_MAX_AGE_HOURS = 24  # refresh sales data once per day
+from dotenv import load_dotenv
+load_dotenv()
 
-
-# ── NAMEBIO PARSER ────────────────────────────────────────────────────────────
-class NameBioParser(HTMLParser):
-    """Parse NameBio search results for .ai domain sales"""
-
-    def __init__(self):
-        super().__init__()
-        self.sales       = []
-        self._in_row     = False
-        self._cell_idx   = 0
-        self._current    = {}
-        self._in_cell    = False
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag == "tr":
-            self._in_row  = True
-            self._cell_idx = 0
-            self._current  = {}
-        if tag == "td" and self._in_row:
-            self._in_cell = True
-
-    def handle_endtag(self, tag):
-        if tag == "td" and self._in_row:
-            self._in_cell = False
-            self._cell_idx += 1
-        if tag == "tr" and self._in_row:
-            if self._current.get("domain") and self._current.get("price"):
-                self.sales.append(dict(self._current))
-            self._in_row = False
-
-    def handle_data(self, data):
-        data = data.strip()
-        if not data or not self._in_cell:
-            return
-        if self._cell_idx == 0 and ".ai" in data.lower():
-            self._current["domain"] = data.lower().strip()
-        elif self._cell_idx == 1:
-            # Price cell: "$12,500" or "12500"
-            try:
-                price = float(data.replace("$", "").replace(",", "").strip())
-                if price > 0:
-                    self._current["price"] = price
-            except ValueError:
-                pass
-        elif self._cell_idx == 2:
-            self._current["date"] = data.strip()
+from core.logger import log, banner
+from core.database import DomainDB
+from core.scorer import DomainScorer
+from generators.keyword_generator import KeywordGenerator
+from generators.ai_generator import AIGenerator
+from generators.vc_scraper import VCScraper
+from hunters.availability_hunter import AvailabilityHunter
+from hunters.expiry_hunter import ExpiryHunter
+from hunters.market_hunter import MarketHunter
+from alerts.notifier import Notifier
 
 
-# ── SCRAPE NAMEBIO ────────────────────────────────────────────────────────────
-async def scrape_namebio(session: aiohttp.ClientSession) -> list[dict]:
-    """Scrape recent .ai domain sales from NameBio"""
-    sales = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-        "Referer": "https://namebio.com",
-    }
-
-    # NameBio search for .ai TLD sales, sorted by recent
-    url = "https://namebio.com/?s=&tld=ai&daterange=&price_from=500&price_to=&order=date&r=1"
-
-    try:
-        async with session.get(url, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                parser = NameBioParser()
-                parser.feed(html)
-                sales.extend(parser.sales)
-                log("PRICE", f"  NameBio: {len(parser.sales)} .ai sales found")
-            else:
-                log("WARN", f"  NameBio: HTTP {resp.status}")
-    except Exception as e:
-        log("WARN", f"  NameBio error: {str(e)[:60]}")
-
-    return sales
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+SCORE_THRESHOLD  = int(os.getenv("SCORE_THRESHOLD", "70"))     # min score to save
+ALERT_THRESHOLD  = int(os.getenv("ALERT_THRESHOLD", "85"))     # min score to alert
+SCAN_INTERVAL_HR = int(os.getenv("SCAN_INTERVAL_HR", "6"))     # hours between auto-scans
+MAX_DOMAINS_PER_RUN = int(os.getenv("MAX_DOMAINS_PER_RUN", "200"))
 
 
-# ── SCRAPE DNJOURNAL ──────────────────────────────────────────────────────────
-async def scrape_dnjournal(session: aiohttp.ClientSession) -> list[dict]:
-    """Scrape DNJournal weekly sales charts for .ai domains"""
-    sales = []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
+# ── ORCHESTRATOR ──────────────────────────────────────────────────────────────
+class DomainFlipBot:
+    def __init__(self, mode="full"):
+        self.mode     = mode
+        self.db       = DomainDB()
+        self.scorer   = DomainScorer()
+        self.notifier = Notifier()
+        self.results  = []
 
-    url = "https://www.dnjournal.com/ytd-sales-charts.htm"
+    async def generate_candidates(self) -> list[str]:
+        """Pull domain candidates from all three generators"""
+        candidates = set()
 
-    try:
-        async with session.get(url, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                # Extract .ai domain + price pairs from page text
-                # DNJournal format: "domain.ai.....$XX,XXX"
-                pattern = r'([a-z0-9\-]{2,30}\.ai)\s*[\.\s]+\$?([\d,]+)'
-                matches = re.findall(pattern, html, re.IGNORECASE)
-                for domain, price_str in matches:
-                    try:
-                        price = float(price_str.replace(",", ""))
-                        if price >= 500:
-                            sales.append({
-                                "domain": domain.lower(),
-                                "price":  price,
-                                "date":   "recent",
-                                "source": "dnjournal"
-                            })
-                    except ValueError:
-                        continue
-                log("PRICE", f"  DNJournal: {len(sales)} .ai sales found")
-            else:
-                log("WARN", f"  DNJournal: HTTP {resp.status}")
-    except Exception as e:
-        log("WARN", f"  DNJournal error: {str(e)[:60]}")
+        # 1. Keyword combinations (always runs)
+        log("GEN", "Building keyword combinations...")
+        kg = KeywordGenerator()
+        kw_domains = kg.generate(limit=300)
+        candidates.update(kw_domains)
+        log("GEN", f"  → {len(kw_domains)} keyword combos generated")
 
-    return sales
+        # 2. AI-generated names
+        if os.getenv("ANTHROPIC_API_KEY"):
+            log("GEN", "Running AI domain generator...")
+            ai = AIGenerator()
+            ai_domains = await ai.generate(limit=100)
+            candidates.update(ai_domains)
+            log("GEN", f"  → {len(ai_domains)} AI-generated names added")
+        else:
+            log("WARN", "No ANTHROPIC_API_KEY — skipping AI generation")
 
+        # 3. VC news scraper
+        log("GEN", "Scraping VC/funding news for trending keywords...")
+        vc = VCScraper()
+        vc_domains = await vc.generate(limit=100)
+        candidates.update(vc_domains)
+        log("GEN", f"  → {len(vc_domains)} VC-trend domains added")
 
-# ── PRICING MODEL ─────────────────────────────────────────────────────────────
-class PricingEngine:
-    """
-    Builds a local model from scraped sales data.
-    Uses comparable sales to price any domain.
-    """
+        total = list(candidates)[:MAX_DOMAINS_PER_RUN]
+        log("GEN", f"Total candidates: {len(total)}")
+        return total
 
-    def __init__(self):
-        self.sales = []
-        self._load_cache()
+    async def hunt_unregistered(self, candidates: list[str]):
+        """Check which candidates are available to register fresh"""
+        log("HUNT", "Checking unregistered availability...")
+        hunter = AvailabilityHunter()
+        available = await hunter.check_bulk(candidates)
+        log("HUNT", f"  → {len(available)} unregistered domains found")
+        return [{"domain": d["domain"], "type": "unregistered", **d} for d in available]
 
-    def _load_cache(self):
-        if SALES_CACHE.exists():
-            try:
-                data = json.loads(SALES_CACHE.read_text())
-                age_hours = (datetime.now() - datetime.fromisoformat(data["updated"])).total_seconds() / 3600
-                if age_hours < CACHE_MAX_AGE_HOURS:
-                    self.sales = data["sales"]
-                    log("PRICE", f"  Loaded {len(self.sales)} cached sales (age: {age_hours:.0f}h)")
-                    return
-            except Exception:
-                pass
-        self.sales = []
+    async def hunt_expiring(self):
+        """Scrape drop lists for expiring .ai domains"""
+        log("HUNT", "Scanning expiring/dropping .ai domains...")
+        hunter = ExpiryHunter()
+        expiring = await hunter.scan()
+        log("HUNT", f"  → {len(expiring)} expiring domains found")
+        return [{"domain": d["domain"], "type": "expiring", **d} for d in expiring]
 
-    def _save_cache(self):
-        SALES_CACHE.parent.mkdir(exist_ok=True)
-        SALES_CACHE.write_text(json.dumps({
-            "updated": datetime.now().isoformat(),
-            "sales":   self.sales,
-        }, indent=2))
+    async def hunt_market(self):
+        """Find underpriced .ai listings on Sedo/Afternic"""
+        log("HUNT", "Scanning aftermarket for underpriced listings...")
+        hunter = MarketHunter()
+        listings = await hunter.scan()
+        log("HUNT", f"  → {len(listings)} aftermarket listings found")
+        return [{"domain": d["domain"], "type": "aftermarket", **d} for d in listings]
 
-    async def refresh(self):
-        """Re-scrape sales data from all sources"""
-        log("PRICE", "Refreshing comparable sales data...")
-        async with aiohttp.ClientSession() as session:
-            nb, dj = await asyncio.gather(
-                scrape_namebio(session),
-                scrape_dnjournal(session),
-                return_exceptions=True
-            )
-            all_sales = []
-            if isinstance(nb, list): all_sales.extend(nb)
-            if isinstance(dj, list): all_sales.extend(dj)
+    def score_and_filter(self, raw_results: list[dict]) -> list[dict]:
+        """Score every result, filter below threshold, sort by score"""
+        scored = []
+        for item in raw_results:
+            score, breakdown = self.scorer.score(item["domain"], item.get("type", "unregistered"))
+            if score >= SCORE_THRESHOLD:
+                item["score"]     = score
+                item["breakdown"] = breakdown
+                item["est_low"], item["est_high"] = self.scorer.estimate_value(score, item["domain"])
+                scored.append(item)
 
-        # Deduplicate
-        seen = set()
-        unique = []
-        for s in all_sales:
-            if s["domain"] not in seen:
-                seen.add(s["domain"])
-                unique.append(s)
+        scored.sort(key=lambda x: -x["score"])
+        return scored
 
-        self.sales = unique
-        self._save_cache()
-        log("PRICE", f"  Total comparable sales: {len(self.sales)}")
-
-    def price_domain(self, domain: str) -> dict:
-        """
-        Return data-backed pricing for a domain.
-        Finds comparable sales by:
-        1. Exact match
-        2. Same word length + similar keyword
-        3. Same TLD + similar character count
-        """
-        name = domain.replace(".ai", "").replace(".io", "").replace(".com", "").lower()
-        tld  = "." + domain.split(".")[-1]
-
-        # 1. Exact match
-        exact = [s for s in self.sales if s["domain"] == domain]
-        if exact:
-            price = exact[0]["price"]
-            return {
-                "suggested_ask":  round(price * 1.2),   # 20% above last sale
-                "comp_low":       price,
-                "comp_high":      round(price * 2.0),
-                "confidence":     "high",
-                "basis":          f"Exact match sale: {domain} = ${price:,.0f}",
-                "comparables":    exact[:3],
-            }
-
-        # 2. Same character count + same TLD
-        tld_comps = [
-            s for s in self.sales
-            if s["domain"].endswith(tld)
-            and abs(len(s["domain"].replace(tld,"")) - len(name)) <= 2
-        ]
-
-        if tld_comps:
-            prices   = sorted([s["price"] for s in tld_comps])
-            p25      = prices[len(prices)//4]
-            p75      = prices[3*len(prices)//4]
-            median   = prices[len(prices)//2]
-            return {
-                "suggested_ask":  round(median * 1.15),
-                "comp_low":       p25,
-                "comp_high":      p75,
-                "confidence":     "medium",
-                "basis":          f"{len(tld_comps)} comparable {tld} sales (similar length)",
-                "comparables":    tld_comps[:5],
-            }
-
-        # 3. All .ai sales as baseline
-        ai_sales = [s for s in self.sales if s["domain"].endswith(".ai")]
-        if ai_sales:
-            prices = sorted([s["price"] for s in ai_sales])
-            median = prices[len(prices)//2]
-            return {
-                "suggested_ask":  round(median * 0.8),
-                "comp_low":       prices[len(prices)//4],
-                "comp_high":      prices[3*len(prices)//4],
-                "confidence":     "low",
-                "basis":          f"Based on {len(ai_sales)} .ai sales (no close comps found)",
-                "comparables":    [],
-            }
-
-        # No data yet
-        return {
-            "suggested_ask":  None,
-            "comp_low":       None,
-            "comp_high":      None,
-            "confidence":     "none",
-            "basis":          "No comparable sales data yet — run refresh()",
-            "comparables":    [],
-        }
-
-    def enrich_results(self, results: list[dict]) -> list[dict]:
-        """Add pricing data to a list of domain results"""
+    def save_results(self, results: list[dict]):
+        """Persist results to SQLite DB"""
         for r in results:
-            pricing = self.price_domain(r["domain"])
-            r["suggested_ask"] = pricing["suggested_ask"]
-            r["price_basis"]   = pricing["basis"]
-            r["price_confidence"] = pricing["confidence"]
-            r["comparables"]   = pricing.get("comparables", [])
-        return results
+            self.db.upsert(r)
+        log("DB", f"Saved {len(results)} results to database")
+
+    def alert_on_hot_finds(self, results: list[dict]):
+        """Send alerts for high-score finds"""
+        hot = [r for r in results if r["score"] >= ALERT_THRESHOLD]
+        if hot:
+            log("ALERT", f"🔥 {len(hot)} HIGH-VALUE domains found — alerting...")
+            self.notifier.send(hot)
+        else:
+            log("ALERT", "No domains above alert threshold this run")
+
+    def print_report(self, results: list[dict]):
+        """Pretty-print top finds to terminal"""
+        print("\n" + "═"*65)
+        print(f"  TOP FINDS — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print("═"*65)
+
+        for i, r in enumerate(results[:20], 1):
+            type_tag = {"unregistered": "🟢 NEW", "expiring": "🟡 DROP", "aftermarket": "🔵 MKT"}.get(r["type"], "⚪")
+            price_str = f"${r.get('market_price','?')}" if r["type"] == "aftermarket" else f"~${r.get('reg_price', 80)}/yr"
+            print(f"  {i:02d}. {r['domain']:<30} score={r['score']:3d}  "
+                  f"est=${r['est_low']//1000}K–${r['est_high']//1000}K  "
+                  f"{type_tag}  {price_str}")
+
+        print("═"*65)
+        print(f"  Total saved: {len(results)}  |  DB: domainbot/data/domains.db")
+        print(f"  Run `python report.py` for full CSV export")
+        print("═"*65 + "\n")
+
+    async def run(self):
+        banner()
+        log("BOT", f"Starting scan — mode={self.mode}")
+        start = time.time()
+
+        all_results = []
+
+        if self.mode in ("full", "fast"):
+            candidates = await self.generate_candidates()
+            unreg = await self.hunt_unregistered(candidates)
+            all_results.extend(unreg)
+
+        if self.mode in ("full", "expiring"):
+            expiring = await self.hunt_expiring()
+            all_results.extend(expiring)
+
+        if self.mode in ("full", "market"):
+            market = await self.hunt_market()
+            all_results.extend(market)
+
+        log("BOT", f"Raw results: {len(all_results)} — scoring and filtering...")
+        scored = self.score_and_filter(all_results)
+
+        self.save_results(scored)
+        self.alert_on_hot_finds(scored)
+        self.print_report(scored)
+
+        elapsed = round(time.time() - start, 1)
+        log("BOT", f"Scan complete in {elapsed}s — {len(scored)} domains above threshold")
+
+
+# ── SCHEDULER (for continuous mode) ──────────────────────────────────────────
+async def run_scheduled(mode):
+    while True:
+        bot = DomainFlipBot(mode=mode)
+        await bot.run()
+        log("SCHED", f"Next scan in {SCAN_INTERVAL_HR} hours...")
+        await asyncio.sleep(SCAN_INTERVAL_HR * 3600)
+
+
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AI Domain Flip Bot")
+    parser.add_argument("--mode", choices=["full","fast","expiring","market"], default="full",
+                        help="Scan mode (default: full)")
+    parser.add_argument("--continuous", action="store_true",
+                        help="Run on a schedule continuously")
+    args = parser.parse_args()
+
+    if args.continuous:
+        asyncio.run(run_scheduled(args.mode))
+    else:
+        asyncio.run(DomainFlipBot(mode=args.mode).run())
